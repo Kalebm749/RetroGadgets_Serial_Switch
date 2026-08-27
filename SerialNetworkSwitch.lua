@@ -178,7 +178,9 @@ end
 local function sendArpRequest(dst, excludePort)
 	dbg("ARP: WHO-HAS " .. dst .. " (excluding P" .. excludePort .. ")")
 	for i = 1, PORT_COUNT do
-		if i ~= excludePort and ports[i].alive then
+		-- Send ARP to any port with an active serial link, not just alive ones.
+		-- A device might not have sent a HELLO yet but can still respond to ARP.
+		if i ~= excludePort and ports[i].serial.IsActive then
 			ports[i].serial:Println("ARP:WHO-HAS:" .. dst)
 			flashPort(i)
 		end
@@ -211,9 +213,24 @@ local function processArpTimeouts()
 	local remaining = {}
 	for _, entry in ipairs(arpQueue) do
 		if (tickCount - entry.sentTick) > ARP_TIMEOUT then
-			dbg("ARP: TIMEOUT for " .. entry.dst .. " — dropping frame from " .. entry.src)
-			recordFrameDrop(entry.srcPort)
-			pushLog(entry.src .. " -> " .. entry.dst .. "  (ARP timeout, dropped)")
+			dbg("ARP: TIMEOUT for " .. entry.dst .. " — fallback flooding frame from " .. entry.src)
+			-- Fallback: flood to all active ports instead of dropping
+			local flooded = false
+			for i = 1, PORT_COUNT do
+				if i ~= entry.srcPort and ports[i].serial.IsActive then
+					ports[i].serial:Println(entry.frame)
+					recordFrameOut(i, entry.frame)
+					flashPort(i)
+					addTrafficAnim(entry.srcPort, i, color.yellow)
+					flooded = true
+				end
+			end
+			if flooded then
+				pushLog(entry.src .. " -> " .. entry.dst .. "  (ARP timeout, flooded)")
+			else
+				recordFrameDrop(entry.srcPort)
+				pushLog(entry.src .. " -> " .. entry.dst .. "  (ARP timeout, no ports)")
+			end
 		else
 			table.insert(remaining, entry)
 		end
@@ -593,6 +610,15 @@ function update()
 				addrTable[p.deviceId] = nil
 			end
 			pushLog((p.deviceId or "?") .. " on P" .. i .. " OFFLINE")
+		end
+
+		-- Diagnostic: warn about ports stuck at LINK (never received any data)
+		-- This usually means the event channel isn't wired in the Multitool
+		if not p.alive and p.serial.IsActive and p.lastSeen == -9999 then
+			if tickCount == 600 then  -- warn once at ~10 seconds
+				dbg("WARNING: P" .. i .. " has LINK but never received data. Is event channel " .. i .. " wired to Serial" .. (i-1) .. "?")
+				pushLog("P" .. i .. " LINK but no data — check wiring!")
+			end
 		end
 	end
 
