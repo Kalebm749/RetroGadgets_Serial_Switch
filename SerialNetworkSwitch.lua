@@ -54,35 +54,25 @@ end
 local COM_PORTS = { 3, 5, 7, 9 } -- example: the "game side" of each pair
 -- -----------------------------------------------------------------
 
--- Port state must also persist across ticks so ledTimer countdowns work.
-if not ports then
-	ports = {}
-	for i = 1, PORT_COUNT do
-		local serialMod = getCompList("Serial", i - 1, i - 1)[1]
-		serialMod.Port = COM_PORTS[i]
-		serialMod.ReceiveMode = SerialReceiveMode.Lines
+-- Port state persists across ticks (top-level runs once at power-on).
+local ports = {}
+for i = 1, PORT_COUNT do
+	local serialMod = getCompList("Serial", i - 1, i - 1)[1]
+	serialMod.Port = COM_PORTS[i]
+	serialMod.ReceiveMode = SerialReceiveMode.Lines
 
-		ports[i] = {
-			serial = serialMod,
-			led = getCompList("Led", i - 1, i - 1)[1],
-			ledTimer = 0,
-		}
-	end
+	ports[i] = {
+		serial = serialMod,
+		led = getCompList("Led", i - 1, i - 1)[1],
+		ledTimer = 0,
+	}
 end
 
 -- MAC/id learning table: device id string -> port index
--- These must persist across ticks. In Retro Gadgets the top-level
--- script body re-runs every frame, so plain `local x = {}` would
--- reset each tick. We guard with an `if not` check so they're only
--- initialized once.
-if not addrTable then
-	addrTable = {}
-end
+local addrTable = {}
 
 -- Rolling log of recent switching decisions, newest first
-if not logLines then
-	logLines = {}
-end
+local logLines = {}
 local MAX_LOG_LINES = 20
 
 local function pushLog(line)
@@ -99,6 +89,10 @@ end
 
 -- Parses "SRC:DST:MESSAGE" -> src, dst, message (nil if malformed)
 local function parseFrame(line)
+	-- Trim whitespace/control chars that serial transport may add
+	line = string.gsub(line, "^%s+", "")
+	line = string.gsub(line, "%s+$", "")
+	line = string.gsub(line, "%c+$", "")
 	local src, dst, msg = string.match(line, "^(.-):(.-):(.*)$")
 	return src, dst, msg
 end
@@ -110,6 +104,12 @@ local function handleFrame(srcPort, line)
 		pushLog("(bad frame on P" .. srcPort .. ")")
 		return
 	end
+
+	-- Normalize IDs: trim and uppercase for consistent lookup
+	src = string.gsub(src, "^%s+", "")
+	src = string.gsub(src, "%s+$", "")
+	dst = string.gsub(dst, "^%s+", "")
+	dst = string.gsub(dst, "%s+$", "")
 
 	addrTable[src] = srcPort
 	flashPort(srcPort)
@@ -196,6 +196,22 @@ local function drawUI()
 		videochip:DrawText(vec2(MARGIN, y), font, "P" .. i, color.white, color.black)
 		videochip:DrawText(vec2(MARGIN + 16, y), font, statusText, statusColor, color.black)
 		videochip:DrawText(vec2(MARGIN + 56, y), font, "COM" .. tostring(COM_PORTS[i]), color.grey, color.black)
+		y = y + LINE_HEIGHT
+	end
+
+	-- MAC address table display
+	y = y + LINE_HEIGHT
+	videochip:DrawText(vec2(MARGIN, y), font, "-- MAC TABLE --", color.yellow, color.black)
+	y = y + LINE_HEIGHT
+
+	local hasEntries = false
+	for id, port in pairs(addrTable) do
+		hasEntries = true
+		videochip:DrawText(vec2(MARGIN, y), font, id .. " -> P" .. port, color.yellow, color.black)
+		y = y + LINE_HEIGHT
+	end
+	if not hasEntries then
+		videochip:DrawText(vec2(MARGIN, y), font, "(empty)", color.grey, color.black)
 		y = y + LINE_HEIGHT
 	end
 
