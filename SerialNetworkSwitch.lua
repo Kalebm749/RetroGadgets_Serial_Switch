@@ -398,7 +398,7 @@ local function drawTrafficVisualizer(x, y, w, h)
 		portPos[i] = { x = px, y = py }
 
 		-- Connection line
-		videochip:DrawLine(vec2(px, py), vec2(centerX, centerY), color(40, 40, 40))
+		videochip:DrawLine(vec2(px, py), vec2(centerX, centerY), ColorRGBA(40, 40, 40, 255))
 
 		-- Port node (larger, colored by status)
 		local nodeColor = color.red
@@ -448,7 +448,7 @@ local function drawUI()
 	drawTrafficVisualizer(splitX, 0, W - splitX, H)
 
 	-- Vertical divider
-	videochip:DrawLine(vec2(splitX - 2, 0), vec2(splitX - 2, H), color(50, 50, 50))
+	videochip:DrawLine(vec2(splitX - 2, 0), vec2(splitX - 2, H), ColorRGBA(50, 50, 50, 255))
 
 	-- ===== LEFT: Info panels =====
 	local y = M
@@ -456,7 +456,7 @@ local function drawUI()
 	-- Title
 	videochip:DrawText(vec2(M, y), font, "NETWORK SWITCH", color.white, color.black)
 	y = y + LH + 2
-	drawHLine(y, color(60, 60, 60))
+	drawHLine(y, ColorRGBA(60, 60, 60, 255))
 	y = y + 4
 
 	-- Port status table
@@ -495,7 +495,7 @@ local function drawUI()
 	end
 
 	y = y + 3
-	drawHLine(y, color(60, 60, 60))
+	drawHLine(y, ColorRGBA(60, 60, 60, 255))
 	y = y + 4
 
 	-- MAC Table (compact, single line per entry)
@@ -526,7 +526,7 @@ local function drawUI()
 	end
 
 	y = y + 3
-	drawHLine(y, color(60, 60, 60))
+	drawHLine(y, ColorRGBA(60, 60, 60, 255))
 	y = y + 4
 
 	-- Traffic log (fill remaining space)
