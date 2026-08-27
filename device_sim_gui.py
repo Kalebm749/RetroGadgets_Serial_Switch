@@ -2,13 +2,18 @@
 device_sim_gui.py — GUI multi-device simulator for the Retro Gadgets serial switch.
 
 Shows all devices simultaneously in a square grid layout. Each cell has:
-  - A header with device ID, port, and connection status
+  - A header with device ID, port, connection status, and drop counter
   - A scrolling terminal output area (shows sent/received messages)
   - An input field at the bottom (type "DEST message" and hit Enter to send)
 
 Features:
+  - Drop detection: sequence numbers in DATA frames, gap detection on receive
   - Auto-test mode: generates realistic random traffic between all connected devices
   - Supports the full switch protocol (HELLO, ARP, DATA frames)
+
+Protocol:
+  - DATA frames include a sequence number: DATA:<src>:<dst>:<seq>:<msg>
+  - Each device tracks per-sender sequence numbers to detect gaps
 
 Requires: pip install pyserial
 
@@ -161,11 +166,18 @@ class DevicePanel:
         self.ser = None
         self.running = False
 
+        # Sequence number tracking
+        self.send_seq = 0  # outgoing sequence number
+        self.recv_seqs = {}  # per-sender: last seen seq number
+        self.sent_count = 0
+        self.recv_count = 0
+        self.dropped_count = 0
+        self.send_fail_count = 0
+
         # --- GUI setup ---
-        # Outer frame with border
         self.frame = ttk.LabelFrame(parent_frame, text=f" {device_id} — {port} ", padding=3)
 
-        # Status indicator
+        # Header with status and stats
         self.header_frame = ttk.Frame(self.frame)
         self.header_frame.pack(fill=tk.X)
 
@@ -176,6 +188,11 @@ class DevicePanel:
         self.status_label = ttk.Label(self.header_frame, text="Disconnected",
                                        font=("Segoe UI", 8))
         self.status_label.pack(side=tk.LEFT)
+
+        # Stats frame on the right side of header
+        self.stats_label = ttk.Label(self.header_frame, text="TX:0 RX:0 DROP:0 FAIL:0",
+                                      font=("Consolas", 8), foreground="gray")
+        self.stats_label.pack(side=tk.RIGHT, padx=(8, 0))
 
         # Terminal output
         self.output = tk.Text(self.frame, wrap=tk.WORD, state=tk.DISABLED,
@@ -189,6 +206,7 @@ class DevicePanel:
         self.output.tag_configure("error", foreground="#ff4444")
         self.output.tag_configure("arp", foreground="#cc88ff")
         self.output.tag_configure("autotest", foreground="#ffaa00")
+        self.output.tag_configure("dropped", foreground="#ff0000", background="#330000")
 
         # Scrollbar
         scrollbar = ttk.Scrollbar(self.output, command=self.output.yview)
@@ -215,6 +233,25 @@ class DevicePanel:
         """Place this panel in the parent grid."""
         self.frame.grid(row=row, column=col, padx=3, pady=3, sticky="nsew")
 
+    def _update_stats_display(self):
+        """Update the stats label (thread-safe)."""
+        drop_color = "#ff4444" if self.dropped_count > 0 else "gray"
+        fail_color = "#ff8800" if self.send_fail_count > 0 else "gray"
+
+        def _set():
+            text = f"TX:{self.sent_count} RX:{self.recv_count}"
+            self.stats_label.config(text=text, foreground="gray")
+
+            # Show drop/fail counts with color if > 0
+            if self.dropped_count > 0 or self.send_fail_count > 0:
+                text += f" DROP:{self.dropped_count} FAIL:{self.send_fail_count}"
+                self.stats_label.config(
+                    text=text,
+                    foreground=drop_color if self.dropped_count > 0 else fail_color
+                )
+
+        self.stats_label.after(0, _set)
+
     def log(self, text: str, tag: str = ""):
         """Append a line to the terminal output (thread-safe via after())."""
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -231,7 +268,6 @@ class DevicePanel:
         self.output.after(0, _append)
 
     def _update_status(self, text: str, color: str):
-        """Update the status indicator (thread-safe)."""
         def _set():
             self.status_dot.config(fg=color)
             self.status_label.config(text=text)
@@ -286,38 +322,72 @@ class DevicePanel:
             # ARP:WHO-HAS:<id>
             if text.startswith("ARP:WHO-HAS:"):
                 target = text[len("ARP:WHO-HAS:"):].strip()
-                self.log(f"<< ARP WHO-HAS {target}", "arp")
                 if target == self.device_id:
                     try:
                         self.ser.write(f"ARP:IS-AT:{self.device_id}\n".encode("utf-8"))
-                        self.log(f">> ARP IS-AT (me!)", "arp")
+                        self.log(f"ARP: {target}? That's me!", "arp")
                     except serial.SerialException:
                         self.log("[ARP reply failed]", "error")
                 continue
 
-            # DATA:<src>:<dst>:<msg>
+            # DATA:<src>:<dst>:<seq>:<msg>  (new format with seq)
+            # Also handles legacy DATA:<src>:<dst>:<msg> (no seq)
             if text.startswith("DATA:"):
-                parts = text[5:].split(":", 2)
-                if len(parts) == 3:
+                payload = text[5:]
+                parts = payload.split(":", 3)
+
+                if len(parts) == 4:
+                    # New format: src:dst:seq:msg
+                    src, dst, seq_str, msg = parts
+                    try:
+                        seq = int(seq_str)
+                        self._check_sequence(src, seq)
+                    except ValueError:
+                        # seq_str wasn't a number — treat as legacy 3-part format
+                        # where parts[2] is actually part of the message
+                        src, dst = parts[0], parts[1]
+                        msg = parts[2] + ":" + parts[3]
+                    self.recv_count += 1
+                    self.log(f"<< [{src}] {msg}")
+                elif len(parts) == 3:
+                    # Legacy format: src:dst:msg
                     src, dst, msg = parts
+                    self.recv_count += 1
                     self.log(f"<< [{src}] {msg}")
                 else:
-                    self.log(f"<< (bad) {text}", "error")
+                    self.log(f"<< (malformed) {text}", "error")
+
+                self._update_stats_display()
                 continue
 
             self.log(f"<< {text}")
 
+    def _check_sequence(self, sender: str, seq: int):
+        """Check for gaps in sequence numbers from a given sender."""
+        if sender in self.recv_seqs:
+            expected = self.recv_seqs[sender] + 1
+            if seq > expected:
+                gap = seq - expected
+                self.dropped_count += gap
+                self.log(f"⚠ DROPPED {gap} msg(s) from {sender} (expected seq {expected}, got {seq})", "dropped")
+        self.recv_seqs[sender] = seq
+
     def send_data(self, dst: str, msg: str, tag: str = "sent"):
-        """Send a DATA frame."""
+        """Send a DATA frame with sequence number."""
         if not self.ser or not self.running:
             return False
-        frame = f"DATA:{self.device_id}:{dst}:{msg}\n"
+        self.send_seq += 1
+        frame = f"DATA:{self.device_id}:{dst}:{self.send_seq}:{msg}\n"
         try:
             self.ser.write(frame.encode("utf-8"))
+            self.sent_count += 1
             self.log(f">> [{dst}] {msg}", tag)
+            self._update_stats_display()
             return True
         except serial.SerialException as e:
-            self.log(f"Send failed: {e}", "error")
+            self.send_fail_count += 1
+            self.log(f"SEND FAILED: {e}", "error")
+            self._update_stats_display()
             return False
 
     def _on_send(self, event=None):
@@ -531,16 +601,14 @@ class App:
     def _build_device_view(self):
         """Build the grid layout with all device panels visible at once."""
         n = len(self.devices)
-        # Calculate grid dimensions (square-ish)
         cols = math.ceil(math.sqrt(n))
         rows = math.ceil(n / cols)
 
-        # Size window appropriately
-        win_w = max(700, cols * 380)
-        win_h = max(500, rows * 320)
+        win_w = max(750, cols * 400)
+        win_h = max(550, rows * 340)
         self.root.geometry(f"{win_w}x{win_h}")
         self.root.resizable(True, True)
-        self.root.minsize(400, 300)
+        self.root.minsize(500, 350)
 
         # Toolbar at top
         toolbar = ttk.Frame(self.root)
@@ -567,13 +635,11 @@ class App:
         grid_frame = ttk.Frame(self.root)
         grid_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
-        # Configure grid weights so cells resize evenly
         for r in range(rows):
             grid_frame.rowconfigure(r, weight=1)
         for c in range(cols):
             grid_frame.columnconfigure(c, weight=1)
 
-        # Create device panels in grid
         for idx, (device_id, port, baud) in enumerate(self.devices):
             row = idx // cols
             col = idx % cols
@@ -581,10 +647,7 @@ class App:
             panel.grid(row, col)
             self.panels.append(panel)
 
-        # Initialize auto-test engine
         self.auto_test = AutoTestEngine(self.panels)
-
-        # Connect all after GUI is drawn
         self.root.after(100, self._connect_all)
 
     def _connect_all(self):
