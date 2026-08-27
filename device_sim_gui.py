@@ -125,7 +125,6 @@ class DeviceTab:
             try:
                 hello = f"HELLO:{self.device_id}\n"
                 self.ser.write(hello.encode("utf-8"))
-                self.log(f">> HELLO (heartbeat)", "heartbeat")
             except serial.SerialException:
                 self.log("[heartbeat: connection lost]", "error")
                 self.running = False

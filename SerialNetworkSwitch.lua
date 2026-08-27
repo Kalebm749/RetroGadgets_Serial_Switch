@@ -170,7 +170,7 @@ end
 -- ============================================================
 
 local function handleHello(srcPort, id)
-	dbg("HELLO from '" .. id .. "' on P" .. srcPort)
+	-- Heartbeat received silently — no debug spam
 	ports[srcPort].deviceId = id
 	ports[srcPort].lastSeen = tickCount
 	ports[srcPort].alive = true
@@ -243,14 +243,14 @@ local function handleLine(srcPort, rawLine)
 	local line = trim(rawLine)
 	if line == nil or line == "" then return end
 
-	dbg("RX P" .. srcPort .. ": " .. line)
-
-	-- HELLO:<id>
+	-- HELLO:<id> — handle silently (no debug log, too frequent)
 	local helloId = string.match(line, "^HELLO:(.*)")
 	if helloId then
 		handleHello(srcPort, trim(helloId))
 		return
 	end
+
+	dbg("RX P" .. srcPort .. ": " .. line)
 
 	-- ARP:IS-AT:<id>
 	local arpId = string.match(line, "^ARP:IS%-AT:(.*)")
