@@ -17,11 +17,10 @@ Usage:
   python device_sim_gui.py PC1:COM13:9600 PC2:COM14:9600   (explicit baud)
 """
 
-import argparse
 import sys
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox
 from datetime import datetime
 
 import serial
@@ -151,37 +150,55 @@ class DeviceTab:
                 pass
 
 
-class AddDeviceDialog:
-    """Simple dialog to configure devices before starting. Can be used as main window."""
+class App:
+    """
+    Single-window application. Uses ONE Tk root for the entire lifetime.
+    Starts with a config view, then swaps to the tabbed device view.
+    """
 
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("Configure Devices")
+    def __init__(self, devices: list = None):
+        self.root = tk.Tk()
+        self.root.title("Retro Gadgets — Serial Switch Device Simulator")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.tabs: list[DeviceTab] = []
+        self.devices = devices
+
+        if self.devices:
+            # Skip config, go straight to device tabs
+            self._build_device_view()
+        else:
+            # Show config UI first
+            self._build_config_view()
+
+    def _build_config_view(self):
+        """Build the device configuration UI inside the root window."""
         self.root.geometry("420x350")
         self.root.resizable(False, False)
 
-        self.devices = []  # list of (id, port, baud) tuples
-        self.result = None
+        self.config_frame = ttk.Frame(self.root)
+        self.config_frame.pack(fill=tk.BOTH, expand=True)
+
+        self._config_devices = []
 
         # Instructions
-        ttk.Label(root, text="Add simulated devices (one per switch port):",
+        ttk.Label(self.config_frame, text="Add simulated devices (one per switch port):",
                   font=("Segoe UI", 10)).pack(pady=(10, 5))
 
         # Device list
-        list_frame = ttk.Frame(root)
+        list_frame = ttk.Frame(self.config_frame)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=10)
 
         self.device_listbox = tk.Listbox(list_frame, font=("Consolas", 10), height=8)
         self.device_listbox.pack(fill=tk.BOTH, expand=True)
 
         # Add device controls
-        add_frame = ttk.Frame(root)
+        add_frame = ttk.Frame(self.config_frame)
         add_frame.pack(fill=tk.X, padx=10, pady=5)
 
         ttk.Label(add_frame, text="ID:").grid(row=0, column=0, padx=2)
         self.id_entry = ttk.Entry(add_frame, width=8)
         self.id_entry.grid(row=0, column=1, padx=2)
-        self.id_entry.insert(0, f"PC{len(self.devices) + 1}")
+        self.id_entry.insert(0, "PC1")
 
         ttk.Label(add_frame, text="Port:").grid(row=0, column=2, padx=2)
         self.port_entry = ttk.Entry(add_frame, width=10)
@@ -196,14 +213,14 @@ class AddDeviceDialog:
         ttk.Button(add_frame, text="Add", command=self._add_device).grid(row=0, column=6, padx=(8, 0))
 
         # Bottom buttons
-        btn_frame = ttk.Frame(root)
+        btn_frame = ttk.Frame(self.config_frame)
         btn_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
 
         ttk.Button(btn_frame, text="Remove Selected", command=self._remove_device).pack(side=tk.LEFT)
-        ttk.Button(btn_frame, text="Start", command=self._start).pack(side=tk.RIGHT)
+        ttk.Button(btn_frame, text="Start", command=self._start_devices).pack(side=tk.RIGHT)
 
         self.id_entry.focus_set()
-        root.bind("<Return>", lambda e: self._add_device())
+        self.root.bind("<Return>", lambda e: self._add_device())
 
     def _add_device(self):
         device_id = self.id_entry.get().strip()
@@ -220,12 +237,12 @@ class AddDeviceDialog:
             messagebox.showwarning("Invalid baud", "Baud rate must be a number.")
             return
 
-        self.devices.append((device_id, port, baud))
+        self._config_devices.append((device_id, port, baud))
         self.device_listbox.insert(tk.END, f"{device_id}  |  {port}  |  {baud} baud")
 
         # Auto-increment ID suggestion
         self.id_entry.delete(0, tk.END)
-        self.id_entry.insert(0, f"PC{len(self.devices) + 1}")
+        self.id_entry.insert(0, f"PC{len(self._config_devices) + 1}")
         self.port_entry.delete(0, tk.END)
         self.port_entry.focus_set()
 
@@ -234,21 +251,23 @@ class AddDeviceDialog:
         if sel:
             idx = sel[0]
             self.device_listbox.delete(idx)
-            self.devices.pop(idx)
+            self._config_devices.pop(idx)
 
-    def _start(self):
-        if not self.devices:
+    def _start_devices(self):
+        if not self._config_devices:
             messagebox.showwarning("No devices", "Add at least one device.")
             return
-        self.result = self.devices
-        self.root.quit()
+        self.devices = self._config_devices
 
+        # Tear down config UI and switch to device view
+        self.root.unbind("<Return>")
+        self.config_frame.destroy()
+        self._build_device_view()
 
-class App:
-    def __init__(self, devices: list):
-        self.root = tk.Tk()
-        self.root.title("Retro Gadgets — Serial Switch Device Simulator")
+    def _build_device_view(self):
+        """Build the tabbed device terminal UI inside the root window."""
         self.root.geometry("700x500")
+        self.root.resizable(True, True)
         self.root.minsize(500, 300)
 
         # Style
@@ -258,14 +277,11 @@ class App:
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
-        self.tabs: list[DeviceTab] = []
-        for device_id, port, baud in devices:
+        for device_id, port, baud in self.devices:
             tab = DeviceTab(self.notebook, device_id, port, baud)
             self.tabs.append(tab)
 
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        # Connect all devices after GUI is set up
+        # Connect all devices after GUI is drawn
         self.root.after(100, self._connect_all)
 
     def _connect_all(self):
@@ -297,20 +313,10 @@ def parse_cli_devices(args: list[str]) -> list[tuple]:
 
 
 def main():
-    # If CLI args provided, skip the dialog
     if len(sys.argv) > 1:
         devices = parse_cli_devices(sys.argv[1:])
     else:
-        # Show config dialog as the main window
-        root = tk.Tk()
-        dialog = AddDeviceDialog(root)
-        root.mainloop()
-        devices = dialog.result
-        root.destroy()
-
-        if not devices:
-            print("No devices configured, exiting.")
-            sys.exit(0)
+        devices = None
 
     app = App(devices)
     app.run()
