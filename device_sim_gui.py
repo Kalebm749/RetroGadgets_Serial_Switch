@@ -5,12 +5,18 @@ Opens a single window with one tab per simulated device. Each tab has:
   - A scrolling terminal output area (shows sent/received messages)
   - An input field at the bottom (type "DEST message" and hit Enter to send)
 
+Supports the full switch protocol:
+  - HELLO:<id>         — heartbeat sent every 2 seconds to announce presence
+  - ARP:WHO-HAS:<id>  — switch asking "who is <id>?" (auto-replied)
+  - ARP:IS-AT:<id>    — reply sent back to switch
+  - DATA:<src>:<dst>:<msg> — payload frames
+
 Requires: pip install pyserial
 
 Usage:
   python device_sim_gui.py
 
-  On launch a small config dialog lets you add devices (id + COM port + baud).
+  On launch a config dialog lets you add devices (id + COM port + baud).
   Or pass them on the command line to skip the dialog:
 
   python device_sim_gui.py PC1:COM13 PC2:COM14 PC3:COM15 PC4:COM16
@@ -19,11 +25,15 @@ Usage:
 
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
 
 import serial
+
+
+HEARTBEAT_INTERVAL = 2.0  # seconds between HELLO messages
 
 
 class DeviceTab:
@@ -46,10 +56,12 @@ class DeviceTab:
                               insertbackground="white")
         self.output.pack(fill=tk.BOTH, expand=True, padx=4, pady=(4, 0))
 
-        # Tag for sent messages (different color)
+        # Tags for different message types
         self.output.tag_configure("sent", foreground="#88ccff")
         self.output.tag_configure("system", foreground="#888888")
         self.output.tag_configure("error", foreground="#ff4444")
+        self.output.tag_configure("arp", foreground="#cc88ff")
+        self.output.tag_configure("heartbeat", foreground="#555555")
 
         # Scrollbar
         scrollbar = ttk.Scrollbar(self.output, command=self.output.yview)
@@ -86,7 +98,7 @@ class DeviceTab:
         self.output.after(0, _append)
 
     def connect(self):
-        """Open the serial port and start the reader thread."""
+        """Open the serial port and start the reader + heartbeat threads."""
         try:
             self.ser = serial.Serial(self.port, self.baud, timeout=1)
             self.running = True
@@ -94,15 +106,34 @@ class DeviceTab:
             self.log("Format: DEST message  (use ALL to broadcast)", "system")
             self.log("", "system")
 
+            # Start reader thread
             reader = threading.Thread(target=self._reader_loop, daemon=True)
             reader.start()
+
+            # Start heartbeat thread
+            heartbeat = threading.Thread(target=self._heartbeat_loop, daemon=True)
+            heartbeat.start()
+
             return True
         except serial.SerialException as e:
             self.log(f"FAILED to open {self.port}: {e}", "error")
             return False
 
+    def _heartbeat_loop(self):
+        """Background thread: sends HELLO:<id> periodically."""
+        while self.running:
+            try:
+                hello = f"HELLO:{self.device_id}\n"
+                self.ser.write(hello.encode("utf-8"))
+                self.log(f">> HELLO (heartbeat)", "heartbeat")
+            except serial.SerialException:
+                self.log("[heartbeat: connection lost]", "error")
+                self.running = False
+                return
+            time.sleep(HEARTBEAT_INTERVAL)
+
     def _reader_loop(self):
-        """Background thread: reads lines from the serial port."""
+        """Background thread: reads lines from the serial port and handles protocol."""
         while self.running:
             try:
                 raw = self.ser.readline()
@@ -113,8 +144,37 @@ class DeviceTab:
             if not raw:
                 continue
             text = raw.decode("utf-8", errors="replace").strip()
-            if text:
-                self.log(f"<< {text}")
+            if not text:
+                continue
+
+            # Handle ARP:WHO-HAS:<id> — auto-reply if it's asking for us
+            if text.startswith("ARP:WHO-HAS:"):
+                target = text[len("ARP:WHO-HAS:"):].strip()
+                self.log(f"<< ARP WHO-HAS {target}", "arp")
+                if target == self.device_id:
+                    reply = f"ARP:IS-AT:{self.device_id}\n"
+                    try:
+                        self.ser.write(reply.encode("utf-8"))
+                        self.log(f">> ARP IS-AT {self.device_id} (that's me!)", "arp")
+                    except serial.SerialException:
+                        self.log("[ARP reply failed]", "error")
+                else:
+                    self.log(f"   (not me, ignoring)", "arp")
+                continue
+
+            # Handle DATA:<src>:<dst>:<msg> — display the message
+            if text.startswith("DATA:"):
+                payload = text[5:]  # strip "DATA:" prefix
+                parts = payload.split(":", 2)
+                if len(parts) == 3:
+                    src, dst, msg = parts
+                    self.log(f"<< [{src}] {msg}")
+                else:
+                    self.log(f"<< (malformed) {text}", "error")
+                continue
+
+            # Legacy format or unknown — just display
+            self.log(f"<< {text}")
 
     def _on_send(self, event=None):
         """Handle Enter key or Send button."""
@@ -133,7 +193,7 @@ class DeviceTab:
             return
 
         dst, msg = parts
-        frame = f"{self.device_id}:{dst}:{msg}\n"
+        frame = f"DATA:{self.device_id}:{dst}:{msg}\n"
         try:
             self.ser.write(frame.encode("utf-8"))
             self.log(f">> [{dst}] {msg}", "sent")
