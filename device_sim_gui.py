@@ -5,11 +5,9 @@ Opens a single window with one tab per simulated device. Each tab has:
   - A scrolling terminal output area (shows sent/received messages)
   - An input field at the bottom (type "DEST message" and hit Enter to send)
 
-Supports the full switch protocol:
-  - HELLO:<id>         — heartbeat sent every 2 seconds to announce presence
-  - ARP:WHO-HAS:<id>  — switch asking "who is <id>?" (auto-replied)
-  - ARP:IS-AT:<id>    — reply sent back to switch
-  - DATA:<src>:<dst>:<msg> — payload frames
+Features:
+  - Auto-test mode: generates realistic random traffic between all connected devices
+  - Supports the full switch protocol (HELLO, ARP, DATA frames)
 
 Requires: pip install pyserial
 
@@ -26,6 +24,7 @@ Usage:
 import sys
 import threading
 import time
+import random
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
@@ -35,6 +34,130 @@ import serial
 
 HEARTBEAT_INTERVAL = 2.0  # seconds between HELLO messages
 
+
+# ============================================================
+# REALISTIC TRAFFIC PATTERNS
+# ============================================================
+
+# Simulated traffic types with realistic payloads
+TRAFFIC_PATTERNS = {
+    "http_request": [
+        "GET /index.html HTTP/1.1",
+        "GET /api/users HTTP/1.1",
+        "POST /api/login HTTP/1.1",
+        "GET /images/logo.png HTTP/1.1",
+        "PUT /api/settings HTTP/1.1",
+        "GET /api/status HTTP/1.1",
+        "DELETE /api/sessions/42 HTTP/1.1",
+        "GET /favicon.ico HTTP/1.1",
+    ],
+    "http_response": [
+        "200 OK {users:[alice,bob,charlie]}",
+        "201 Created {id:42}",
+        "404 Not Found",
+        "500 Internal Server Error",
+        "301 Moved Permanently -> /new-path",
+        "200 OK {status:healthy,uptime:3600}",
+        "403 Forbidden",
+        "200 OK <html>...</html>",
+    ],
+    "dns_query": [
+        "DNS QUERY A example.com",
+        "DNS QUERY AAAA google.com",
+        "DNS QUERY MX company.org",
+        "DNS QUERY A api.service.local",
+        "DNS QUERY PTR 192.168.1.1",
+        "DNS QUERY CNAME cdn.example.com",
+    ],
+    "dns_response": [
+        "DNS REPLY A 93.184.216.34",
+        "DNS REPLY AAAA 2607:f8b0:4004:800::200e",
+        "DNS REPLY MX mail.company.org pri=10",
+        "DNS REPLY A 10.0.0.50",
+        "DNS REPLY PTR router.local",
+        "DNS REPLY CNAME d1234.cloudfront.net",
+    ],
+    "ping": [
+        "ICMP ECHO seq=1 ttl=64",
+        "ICMP ECHO seq=2 ttl=64",
+        "ICMP ECHO seq=3 ttl=64",
+        "ICMP ECHO-REPLY seq=1 time=2ms",
+        "ICMP ECHO-REPLY seq=2 time=1ms",
+        "ICMP ECHO-REPLY seq=3 time=3ms",
+    ],
+    "file_transfer": [
+        "FTP STOR report_q3.xlsx [2.4MB]",
+        "FTP RETR backup_20240801.tar.gz [156MB]",
+        "SCP upload config.yaml -> /etc/app/",
+        "FTP LIST /shared/documents/",
+        "SMB READ \\\\fileserver\\docs\\meeting_notes.docx",
+        "FTP STOR database_dump.sql [45MB]",
+    ],
+    "chat": [
+        "MSG hey, are you there?",
+        "MSG meeting in 5 minutes",
+        "MSG can you review my PR?",
+        "MSG server is back up",
+        "MSG lunch?",
+        "MSG pushed the fix to main",
+        "MSG build is green now",
+        "MSG deploying to staging",
+    ],
+    "database": [
+        "SQL SELECT * FROM users WHERE active=1",
+        "SQL INSERT INTO logs (event,ts) VALUES(...)",
+        "SQL UPDATE sessions SET last_seen=NOW()",
+        "SQL DELETE FROM cache WHERE expired<NOW()",
+        "REDIS GET session:abc123",
+        "REDIS SET ratelimit:user42 EX 60",
+    ],
+    "monitoring": [
+        "METRIC cpu_usage=72% host=web01",
+        "METRIC mem_free=1.2GB host=db01",
+        "ALERT disk_usage>90% host=storage01",
+        "METRIC req_per_sec=1420 svc=api",
+        "HEARTBEAT service=auth status=healthy",
+        "METRIC latency_p99=45ms svc=gateway",
+    ],
+}
+
+# Traffic scenarios: weighted sequences of what a "conversation" looks like
+TRAFFIC_SCENARIOS = [
+    # Web browsing: DNS -> HTTP request -> HTTP response
+    {"weight": 30, "sequence": ["dns_query", "dns_response", "http_request", "http_response"]},
+    # Ping exchange
+    {"weight": 15, "sequence": ["ping", "ping", "ping"]},
+    # File transfer
+    {"weight": 10, "sequence": ["file_transfer"]},
+    # Chat messages
+    {"weight": 20, "sequence": ["chat", "chat"]},
+    # Database queries
+    {"weight": 15, "sequence": ["database", "database"]},
+    # Monitoring
+    {"weight": 10, "sequence": ["monitoring", "monitoring"]},
+]
+
+
+def pick_scenario():
+    """Pick a random traffic scenario based on weights."""
+    total = sum(s["weight"] for s in TRAFFIC_SCENARIOS)
+    r = random.randint(1, total)
+    cumulative = 0
+    for scenario in TRAFFIC_SCENARIOS:
+        cumulative += scenario["weight"]
+        if r <= cumulative:
+            return scenario
+    return TRAFFIC_SCENARIOS[0]
+
+
+def pick_message(pattern_type: str) -> str:
+    """Pick a random message from a traffic pattern."""
+    return random.choice(TRAFFIC_PATTERNS[pattern_type])
+
+
+# ============================================================
+# DEVICE TAB
+# ============================================================
 
 class DeviceTab:
     """One simulated device — owns a serial connection and a GUI tab."""
@@ -61,7 +184,7 @@ class DeviceTab:
         self.output.tag_configure("system", foreground="#888888")
         self.output.tag_configure("error", foreground="#ff4444")
         self.output.tag_configure("arp", foreground="#cc88ff")
-        self.output.tag_configure("heartbeat", foreground="#555555")
+        self.output.tag_configure("autotest", foreground="#ffaa00")
 
         # Scrollbar
         scrollbar = ttk.Scrollbar(self.output, command=self.output.yview)
@@ -175,6 +298,19 @@ class DeviceTab:
             # Legacy format or unknown — just display
             self.log(f"<< {text}")
 
+    def send_data(self, dst: str, msg: str, tag: str = "sent"):
+        """Send a DATA frame (used by both manual input and auto-test)."""
+        if not self.ser or not self.running:
+            return False
+        frame = f"DATA:{self.device_id}:{dst}:{msg}\n"
+        try:
+            self.ser.write(frame.encode("utf-8"))
+            self.log(f">> [{dst}] {msg}", tag)
+            return True
+        except serial.SerialException as e:
+            self.log(f"Send failed: {e}", "error")
+            return False
+
     def _on_send(self, event=None):
         """Handle Enter key or Send button."""
         raw = self.input_entry.get().strip()
@@ -192,12 +328,7 @@ class DeviceTab:
             return
 
         dst, msg = parts
-        frame = f"DATA:{self.device_id}:{dst}:{msg}\n"
-        try:
-            self.ser.write(frame.encode("utf-8"))
-            self.log(f">> [{dst}] {msg}", "sent")
-        except serial.SerialException as e:
-            self.log(f"Send failed: {e}", "error")
+        self.send_data(dst, msg)
 
     def disconnect(self):
         """Clean up the serial port."""
@@ -208,6 +339,98 @@ class DeviceTab:
             except Exception:
                 pass
 
+
+# ============================================================
+# AUTO-TEST ENGINE
+# ============================================================
+
+class AutoTestEngine:
+    """Generates realistic random traffic across all connected devices."""
+
+    def __init__(self, tabs: list):
+        self.tabs = tabs
+        self.running = False
+        self._thread = None
+        self.rate = 2.0  # messages per second (across all devices)
+        self.burst_chance = 0.15  # chance of a burst (multiple rapid messages)
+
+    def start(self, rate: float = 2.0):
+        """Start generating traffic."""
+        if self.running:
+            return
+        self.rate = rate
+        self.running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """Stop generating traffic."""
+        self.running = False
+
+    def _get_alive_tabs(self):
+        """Get list of tabs that are connected and running."""
+        return [t for t in self.tabs if t.running and t.ser]
+
+    def _run(self):
+        """Main auto-test loop."""
+        while self.running:
+            alive = self._get_alive_tabs()
+            if len(alive) < 2:
+                time.sleep(0.5)
+                continue
+
+            # Pick a scenario
+            scenario = pick_scenario()
+
+            # Pick sender and receiver for this scenario
+            sender = random.choice(alive)
+            others = [t for t in alive if t is not sender]
+            receiver = random.choice(others)
+
+            # Decide if this is a broadcast (10% chance)
+            is_broadcast = random.random() < 0.10
+
+            # Execute the scenario sequence
+            for pattern_type in scenario["sequence"]:
+                if not self.running:
+                    break
+
+                msg = pick_message(pattern_type)
+                dst = "ALL" if is_broadcast else receiver.device_id
+                sender.send_data(dst, msg, "autotest")
+
+                # Small delay between messages in a sequence (simulates RTT)
+                delay = random.uniform(0.1, 0.4)
+                time.sleep(delay)
+
+                # For request-response patterns, swap sender/receiver
+                if "response" in pattern_type or "REPLY" in pattern_type:
+                    sender, receiver = receiver, sender
+                    if receiver not in alive:
+                        receiver = random.choice([t for t in alive if t is not sender])
+
+            # Check for burst mode
+            if random.random() < self.burst_chance:
+                burst_count = random.randint(3, 8)
+                for _ in range(burst_count):
+                    if not self.running:
+                        break
+                    burst_sender = random.choice(alive)
+                    burst_others = [t for t in alive if t is not burst_sender]
+                    burst_receiver = random.choice(burst_others)
+                    burst_msg = pick_message(random.choice(list(TRAFFIC_PATTERNS.keys())))
+                    burst_sender.send_data(burst_receiver.device_id, burst_msg, "autotest")
+                    time.sleep(random.uniform(0.05, 0.15))
+
+            # Wait based on configured rate
+            base_delay = 1.0 / self.rate
+            jitter = random.uniform(-base_delay * 0.3, base_delay * 0.3)
+            time.sleep(max(0.1, base_delay + jitter))
+
+
+# ============================================================
+# MAIN APP
+# ============================================================
 
 class App:
     """
@@ -221,12 +444,11 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.tabs: list[DeviceTab] = []
         self.devices = devices
+        self.auto_test: AutoTestEngine = None
 
         if self.devices:
-            # Skip config, go straight to device tabs
             self._build_device_view()
         else:
-            # Show config UI first
             self._build_config_view()
 
     def _build_config_view(self):
@@ -325,7 +547,7 @@ class App:
 
     def _build_device_view(self):
         """Build the tabbed device terminal UI inside the root window."""
-        self.root.geometry("700x500")
+        self.root.geometry("750x550")
         self.root.resizable(True, True)
         self.root.minsize(500, 300)
 
@@ -333,12 +555,39 @@ class App:
         style = ttk.Style()
         style.configure("TNotebook.Tab", padding=[12, 4])
 
+        # Toolbar frame at top
+        toolbar = ttk.Frame(self.root)
+        toolbar.pack(fill=tk.X, padx=4, pady=(4, 0))
+
+        # Auto-test controls
+        ttk.Label(toolbar, text="Auto-Test:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(4, 8))
+
+        self.autotest_btn = ttk.Button(toolbar, text="▶ Start", command=self._toggle_autotest)
+        self.autotest_btn.pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(toolbar, text="Rate:").pack(side=tk.LEFT, padx=(12, 4))
+        self.rate_var = tk.StringVar(value="2.0")
+        self.rate_spinbox = ttk.Spinbox(toolbar, from_=0.5, to=20.0, increment=0.5,
+                                         textvariable=self.rate_var, width=5,
+                                         font=("Consolas", 9))
+        self.rate_spinbox.pack(side=tk.LEFT, padx=2)
+        ttk.Label(toolbar, text="msg/s", font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(0, 8))
+
+        # Status indicator
+        self.status_label = ttk.Label(toolbar, text="● Idle", foreground="gray",
+                                       font=("Segoe UI", 9))
+        self.status_label.pack(side=tk.RIGHT, padx=8)
+
+        # Notebook with device tabs
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
         for device_id, port, baud in self.devices:
             tab = DeviceTab(self.notebook, device_id, port, baud)
             self.tabs.append(tab)
+
+        # Initialize auto-test engine
+        self.auto_test = AutoTestEngine(self.tabs)
 
         # Connect all devices after GUI is drawn
         self.root.after(100, self._connect_all)
@@ -347,7 +596,28 @@ class App:
         for tab in self.tabs:
             tab.connect()
 
+    def _toggle_autotest(self):
+        """Toggle auto-test on/off."""
+        if self.auto_test and self.auto_test.running:
+            self.auto_test.stop()
+            self.autotest_btn.config(text="▶ Start")
+            self.status_label.config(text="● Idle", foreground="gray")
+            self.rate_spinbox.config(state="normal")
+        else:
+            try:
+                rate = float(self.rate_var.get())
+            except ValueError:
+                rate = 2.0
+            rate = max(0.5, min(20.0, rate))
+
+            self.auto_test.start(rate)
+            self.autotest_btn.config(text="⏹ Stop")
+            self.status_label.config(text=f"● Running ({rate:.1f} msg/s)", foreground="#ff8800")
+            self.rate_spinbox.config(state="disabled")
+
     def _on_close(self):
+        if self.auto_test:
+            self.auto_test.stop()
         for tab in self.tabs:
             tab.disconnect()
         self.root.destroy()

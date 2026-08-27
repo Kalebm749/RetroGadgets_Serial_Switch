@@ -82,9 +82,15 @@ for i = 1, PORT_COUNT do
 		led = getComp("Led", i - 1),
 		ledTimer = 0,
 		-- Device presence tracking
-		deviceId = nil,        -- the ID announced by HELLO
-		lastSeen = -9999,      -- tick when last HELLO received
-		alive = false,         -- true if within HEARTBEAT_TIMEOUT
+		deviceId = nil,
+		lastSeen = -9999,
+		alive = false,
+		-- Port statistics
+		framesIn = 0,
+		framesOut = 0,
+		framesDropped = 0,
+		bytesIn = 0,
+		bytesOut = 0,
 	}
 	dbg("  Port " .. i .. " -> COM" .. COM_PORTS[i])
 end
@@ -94,13 +100,18 @@ local addrTable = {}
 
 -- Rolling log of recent switching decisions, newest first
 local logLines = {}
-local MAX_LOG_LINES = 20
+local MAX_LOG_LINES = 12
 
 -- ARP pending queue: list of {dst, srcPort, frame, sentTick}
 local arpQueue = {}
 
 -- Global tick counter
 local tickCount = 0
+
+-- Traffic visualizer: active animations
+-- Each entry: {srcPort, dstPort, progress (0.0-1.0), color}
+local trafficAnims = {}
+local ANIM_SPEED = 0.05  -- progress per tick (20 ticks = full travel)
 
 -- ============================================================
 -- LOGGING
@@ -116,6 +127,48 @@ end
 local function flashPort(i)
 	ports[i].led.State = true
 	ports[i].ledTimer = 6
+end
+
+-- ============================================================
+-- TRAFFIC VISUALIZER
+-- ============================================================
+
+local function addTrafficAnim(srcPort, dstPort, animColor)
+	table.insert(trafficAnims, {
+		srcPort = srcPort,
+		dstPort = dstPort,
+		progress = 0.0,
+		color = animColor or color.cyan,
+	})
+end
+
+local function updateTrafficAnims()
+	local remaining = {}
+	for _, anim in ipairs(trafficAnims) do
+		anim.progress = anim.progress + ANIM_SPEED
+		if anim.progress < 1.0 then
+			table.insert(remaining, anim)
+		end
+	end
+	trafficAnims = remaining
+end
+
+-- ============================================================
+-- STATS HELPERS
+-- ============================================================
+
+local function recordFrameIn(portIdx, line)
+	ports[portIdx].framesIn = ports[portIdx].framesIn + 1
+	ports[portIdx].bytesIn = ports[portIdx].bytesIn + string.len(line)
+end
+
+local function recordFrameOut(portIdx, line)
+	ports[portIdx].framesOut = ports[portIdx].framesOut + 1
+	ports[portIdx].bytesOut = ports[portIdx].bytesOut + string.len(line)
+end
+
+local function recordFrameDrop(portIdx)
+	ports[portIdx].framesDropped = ports[portIdx].framesDropped + 1
 end
 
 -- ============================================================
@@ -143,7 +196,9 @@ local function handleArpReply(srcPort, id)
 		if entry.dst == id then
 			dbg("ARP: Delivering buffered frame to " .. id .. " via P" .. srcPort)
 			ports[srcPort].serial:Println(entry.frame)
+			recordFrameOut(srcPort, entry.frame)
 			flashPort(srcPort)
+			addTrafficAnim(entry.srcPort, srcPort, color.green)
 			pushLog(entry.src .. " -> " .. id .. "  (fwd P" .. srcPort .. ", post-ARP)")
 		else
 			table.insert(remaining, entry)
@@ -157,6 +212,7 @@ local function processArpTimeouts()
 	for _, entry in ipairs(arpQueue) do
 		if (tickCount - entry.sentTick) > ARP_TIMEOUT then
 			dbg("ARP: TIMEOUT for " .. entry.dst .. " — dropping frame from " .. entry.src)
+			recordFrameDrop(entry.srcPort)
 			pushLog(entry.src .. " -> " .. entry.dst .. "  (ARP timeout, dropped)")
 		else
 			table.insert(remaining, entry)
@@ -170,7 +226,6 @@ end
 -- ============================================================
 
 local function handleHello(srcPort, id)
-	-- Heartbeat received silently — no debug spam
 	ports[srcPort].deviceId = id
 	ports[srcPort].lastSeen = tickCount
 	ports[srcPort].alive = true
@@ -183,6 +238,7 @@ local function handleDataFrame(srcPort, line)
 	if src == nil or dst == nil then
 		dbg("BAD DATA FRAME on P" .. srcPort .. ": " .. line)
 		pushLog("(bad frame on P" .. srcPort .. ")")
+		recordFrameDrop(srcPort)
 		return
 	end
 
@@ -196,6 +252,7 @@ local function handleDataFrame(srcPort, line)
 	ports[srcPort].deviceId = src
 	ports[srcPort].lastSeen = tickCount
 	ports[srcPort].alive = true
+	recordFrameIn(srcPort, line)
 	flashPort(srcPort)
 
 	-- Broadcast
@@ -204,7 +261,9 @@ local function handleDataFrame(srcPort, line)
 		for i = 1, PORT_COUNT do
 			if i ~= srcPort then
 				ports[i].serial:Println(line)
+				recordFrameOut(i, line)
 				flashPort(i)
+				addTrafficAnim(srcPort, i, color.yellow)
 			end
 		end
 		pushLog(src .. " -> ALL  (broadcast)")
@@ -216,7 +275,9 @@ local function handleDataFrame(srcPort, line)
 	if knownPort ~= nil and knownPort ~= srcPort then
 		dbg("  -> Forwarding to P" .. knownPort .. " (known)")
 		ports[knownPort].serial:Println(line)
+		recordFrameOut(knownPort, line)
 		flashPort(knownPort)
+		addTrafficAnim(srcPort, knownPort, color.green)
 		pushLog(src .. " -> " .. dst .. "  (fwd P" .. knownPort .. ")")
 		return
 	end
@@ -224,11 +285,13 @@ local function handleDataFrame(srcPort, line)
 	-- Unknown destination: ARP instead of blind flood
 	dbg("  -> Unknown dst '" .. dst .. "', sending ARP WHO-HAS")
 	sendArpRequest(dst, srcPort)
+	addTrafficAnim(srcPort, 0, color.magenta)  -- 0 = "to switch center" for ARP visual
 
 	-- Buffer the frame while waiting for ARP reply
 	table.insert(arpQueue, {
 		dst = dst,
 		src = src,
+		srcPort = srcPort,
 		frame = line,
 		sentTick = tickCount,
 	})
@@ -320,72 +383,193 @@ end
 local LINE_HEIGHT = 8
 local MARGIN = 4
 
+-- Format byte count nicely
+local function fmtBytes(b)
+	if b >= 1048576 then
+		return string.format("%.1fMB", b / 1048576)
+	elseif b >= 1024 then
+		return string.format("%.1fKB", b / 1024)
+	else
+		return tostring(b) .. "B"
+	end
+end
+
+local function drawTrafficVisualizer(x, y, w, h)
+	-- Draw a central switch box with ports around it
+	-- Layout: ports on left side, switch box in center
+	local centerX = x + math.floor(w / 2)
+	local centerY = y + math.floor(h / 2)
+	local switchSize = 12
+
+	-- Draw switch box in center
+	videochip:DrawRect(
+		vec2(centerX - switchSize, centerY - switchSize),
+		vec2(centerX + switchSize, centerY + switchSize),
+		color.white
+	)
+	videochip:DrawText(vec2(centerX - 5, centerY - 3), font, "SW", color.white, color.black)
+
+	-- Port positions (arranged around the switch)
+	local portPositions = {}
+	local radius = math.min(w, h) / 2 - 8
+	for i = 1, PORT_COUNT do
+		local angle = (i - 1) * (2 * math.pi / PORT_COUNT) - math.pi / 2
+		local px = centerX + math.floor(math.cos(angle) * radius)
+		local py = centerY + math.floor(math.sin(angle) * radius)
+		portPositions[i] = { x = px, y = py }
+
+		-- Port dot
+		local dotColor = color.red
+		if ports[i].alive then
+			dotColor = color.green
+		elseif ports[i].serial.IsActive then
+			dotColor = color.yellow
+		end
+		videochip:DrawCircle(vec2(px, py), 3, dotColor)
+
+		-- Port label
+		local labelX = px - 3
+		local labelY = py + 4
+		if py < centerY then labelY = py - 10 end
+		videochip:DrawText(vec2(labelX, labelY), font, "P" .. i, color.gray, color.black)
+
+		-- Static line from port to switch center
+		videochip:DrawLine(vec2(px, py), vec2(centerX, centerY), color.gray)
+	end
+
+	-- Draw animated packets
+	for _, anim in ipairs(trafficAnims) do
+		local srcPos = portPositions[anim.srcPort]
+		local dstPos
+		if anim.dstPort == 0 then
+			-- ARP: animate toward center
+			dstPos = { x = centerX, y = centerY }
+		elseif portPositions[anim.dstPort] then
+			dstPos = portPositions[anim.dstPort]
+		else
+			dstPos = { x = centerX, y = centerY }
+		end
+
+		if srcPos and dstPos then
+			-- Interpolate position
+			local px = srcPos.x + math.floor((dstPos.x - srcPos.x) * anim.progress)
+			local py = srcPos.y + math.floor((dstPos.y - srcPos.y) * anim.progress)
+			videochip:DrawCircle(vec2(px, py), 2, anim.color)
+		end
+	end
+end
+
 local function drawUI()
 	videochip:Clear(color.black)
 
-	local y = MARGIN
-	videochip:DrawText(vec2(MARGIN, y), font, "-- SERIAL SWITCH --", color.white, color.black)
-	y = y + LINE_HEIGHT * 2
+	local screenW = videochip.Width
+	local screenH = videochip.Height
 
-	-- Port status with device presence
+	-- Layout: left panel (text info), right panel (traffic visualizer)
+	local vizWidth = math.min(100, math.floor(screenW * 0.4))
+	local textWidth = screenW - vizWidth - MARGIN
+
+	-- ===== RIGHT PANEL: Traffic Visualizer =====
+	local vizX = screenW - vizWidth
+	drawTrafficVisualizer(vizX, MARGIN, vizWidth - MARGIN, screenH - MARGIN * 2)
+
+	-- ===== LEFT PANEL: Text info =====
+	local y = MARGIN
+
+	-- Header
+	videochip:DrawText(vec2(MARGIN, y), font, "SERIAL SWITCH", color.white, color.black)
+	y = y + LINE_HEIGHT + 2
+
+	-- Port status with stats
+	videochip:DrawText(vec2(MARGIN, y), font, "PORT STATUS", color.white, color.black)
+	y = y + LINE_HEIGHT
+
 	for i = 1, PORT_COUNT do
 		local p = ports[i]
-		local linkUp = p.serial.IsActive
-		local devAlive = p.alive
 		local statusText
 		local statusColor
 
-		if devAlive then
-			statusText = "ONLINE"
+		if p.alive then
+			statusText = "ON"
 			statusColor = color.green
-		elseif linkUp then
-			statusText = "LINK"
+		elseif p.serial.IsActive then
+			statusText = "LK"
 			statusColor = color.yellow
 		else
-			statusText = "DOWN"
+			statusText = "--"
 			statusColor = color.red
 		end
 
 		local devName = p.deviceId or "---"
+		local statsStr = string.format("%dI/%dO", p.framesIn, p.framesOut)
+		if p.framesDropped > 0 then
+			statsStr = statsStr .. "/" .. p.framesDropped .. "D"
+		end
+
 		videochip:DrawText(vec2(MARGIN, y), font, "P" .. i, color.white, color.black)
-		videochip:DrawText(vec2(MARGIN + 16, y), font, statusText, statusColor, color.black)
-		videochip:DrawText(vec2(MARGIN + 56, y), font, devName, color.gray, color.black)
+		videochip:DrawText(vec2(MARGIN + 12, y), font, statusText, statusColor, color.black)
+		videochip:DrawText(vec2(MARGIN + 28, y), font, devName, color.gray, color.black)
+		videochip:DrawText(vec2(MARGIN + 60, y), font, statsStr, color.gray, color.black)
 		y = y + LINE_HEIGHT
 	end
 
-	-- MAC address table
+	-- Port byte totals
+	y = y + 2
+	videochip:DrawText(vec2(MARGIN, y), font, "THROUGHPUT", color.white, color.black)
 	y = y + LINE_HEIGHT
-	videochip:DrawText(vec2(MARGIN, y), font, "-- MAC TABLE --", color.yellow, color.black)
+	for i = 1, PORT_COUNT do
+		local p = ports[i]
+		local throughStr = "P" .. i .. " " .. fmtBytes(p.bytesIn) .. " in / " .. fmtBytes(p.bytesOut) .. " out"
+		videochip:DrawText(vec2(MARGIN, y), font, throughStr, color.gray, color.black)
+		y = y + LINE_HEIGHT
+	end
+
+	-- MAC table (compact)
+	y = y + 2
+	videochip:DrawText(vec2(MARGIN, y), font, "MAC TABLE", color.yellow, color.black)
 	y = y + LINE_HEIGHT
 
 	local hasEntries = false
+	local macStr = ""
 	for id, port in pairs(addrTable) do
 		hasEntries = true
-		videochip:DrawText(vec2(MARGIN, y), font, id .. " -> P" .. port, color.yellow, color.black)
-		y = y + LINE_HEIGHT
+		if macStr ~= "" then macStr = macStr .. " | " end
+		macStr = macStr .. id .. ":P" .. port
 	end
-	if not hasEntries then
+	if hasEntries then
+		-- Wrap if too long
+		if string.len(macStr) > math.floor(textWidth / 4) then
+			-- Split into multiple lines
+			for id, port in pairs(addrTable) do
+				videochip:DrawText(vec2(MARGIN, y), font, id .. " -> P" .. port, color.yellow, color.black)
+				y = y + LINE_HEIGHT
+			end
+		else
+			videochip:DrawText(vec2(MARGIN, y), font, macStr, color.yellow, color.black)
+			y = y + LINE_HEIGHT
+		end
+	else
 		videochip:DrawText(vec2(MARGIN, y), font, "(empty)", color.gray, color.black)
 		y = y + LINE_HEIGHT
 	end
 
-	-- ARP queue
+	-- ARP queue (if any)
 	if #arpQueue > 0 then
-		y = y + LINE_HEIGHT
-		videochip:DrawText(vec2(MARGIN, y), font, "-- ARP PENDING --", color.magenta, color.black)
+		y = y + 2
+		videochip:DrawText(vec2(MARGIN, y), font, "ARP PENDING", color.magenta, color.black)
 		y = y + LINE_HEIGHT
 		for _, entry in ipairs(arpQueue) do
-			videochip:DrawText(vec2(MARGIN, y), font, "WHO-HAS " .. entry.dst .. " (from " .. entry.src .. ")", color.magenta, color.black)
+			videochip:DrawText(vec2(MARGIN, y), font, "? " .. entry.dst .. " <-" .. entry.src, color.magenta, color.black)
 			y = y + LINE_HEIGHT
 		end
 	end
 
-	-- Traffic log
-	y = y + LINE_HEIGHT
-	videochip:DrawText(vec2(MARGIN, y), font, "-- TRAFFIC LOG --", color.white, color.black)
+	-- Traffic log (fill remaining space)
+	y = y + 2
+	videochip:DrawText(vec2(MARGIN, y), font, "LOG", color.white, color.black)
 	y = y + LINE_HEIGHT
 
-	local maxLines = math.floor((videochip.Height - y) / LINE_HEIGHT)
+	local maxLines = math.floor((screenH - y) / LINE_HEIGHT)
 	for i = 1, math.min(maxLines, #logLines) do
 		videochip:DrawText(vec2(MARGIN, y), font, logLines[i], color.cyan, color.black)
 		y = y + LINE_HEIGHT
@@ -405,7 +589,6 @@ function update()
 		if p.alive and (tickCount - p.lastSeen) > HEARTBEAT_TIMEOUT then
 			dbg("TIMEOUT: Device '" .. (p.deviceId or "?") .. "' on P" .. i .. " went offline")
 			p.alive = false
-			-- Remove from addrTable
 			if p.deviceId and addrTable[p.deviceId] == i then
 				addrTable[p.deviceId] = nil
 			end
@@ -415,6 +598,9 @@ function update()
 
 	-- Process ARP timeouts
 	processArpTimeouts()
+
+	-- Update traffic animations
+	updateTrafficAnims()
 
 	-- LED countdown
 	for i = 1, PORT_COUNT do
