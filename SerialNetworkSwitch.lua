@@ -25,7 +25,7 @@
 local PORT_COUNT = 4
 
 -- ---- EDIT THESE to match your com0com/socat virtual port numbers ----
-local COM_PORTS = { 3, 5, 7, 9 }
+local COM_PORTS = { 21, 31, 41, 51 }
 -- -----------------------------------------------------------------
 
 -- How many ticks before a device is considered disconnected
@@ -349,7 +349,7 @@ local function drawUI()
 		local devName = p.deviceId or "---"
 		videochip:DrawText(vec2(MARGIN, y), font, "P" .. i, color.white, color.black)
 		videochip:DrawText(vec2(MARGIN + 16, y), font, statusText, statusColor, color.black)
-		videochip:DrawText(vec2(MARGIN + 56, y), font, devName, color.grey, color.black)
+		videochip:DrawText(vec2(MARGIN + 56, y), font, devName, color.gray, color.black)
 		y = y + LINE_HEIGHT
 	end
 
@@ -365,7 +365,7 @@ local function drawUI()
 		y = y + LINE_HEIGHT
 	end
 	if not hasEntries then
-		videochip:DrawText(vec2(MARGIN, y), font, "(empty)", color.grey, color.black)
+		videochip:DrawText(vec2(MARGIN, y), font, "(empty)", color.gray, color.black)
 		y = y + LINE_HEIGHT
 	end
 
