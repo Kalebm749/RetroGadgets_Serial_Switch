@@ -151,33 +151,31 @@ class DeviceTab:
                 pass
 
 
-class AddDeviceDialog(tk.Toplevel):
-    """Simple dialog to configure devices before starting."""
+class AddDeviceDialog:
+    """Simple dialog to configure devices before starting. Can be used as main window."""
 
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.title("Configure Devices")
-        self.geometry("420x350")
-        self.resizable(False, False)
-        self.transient(parent)
-        self.grab_set()
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("Configure Devices")
+        self.root.geometry("420x350")
+        self.root.resizable(False, False)
 
         self.devices = []  # list of (id, port, baud) tuples
         self.result = None
 
         # Instructions
-        ttk.Label(self, text="Add simulated devices (one per switch port):",
+        ttk.Label(root, text="Add simulated devices (one per switch port):",
                   font=("Segoe UI", 10)).pack(pady=(10, 5))
 
         # Device list
-        list_frame = ttk.Frame(self)
+        list_frame = ttk.Frame(root)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=10)
 
         self.device_listbox = tk.Listbox(list_frame, font=("Consolas", 10), height=8)
         self.device_listbox.pack(fill=tk.BOTH, expand=True)
 
         # Add device controls
-        add_frame = ttk.Frame(self)
+        add_frame = ttk.Frame(root)
         add_frame.pack(fill=tk.X, padx=10, pady=5)
 
         ttk.Label(add_frame, text="ID:").grid(row=0, column=0, padx=2)
@@ -198,14 +196,14 @@ class AddDeviceDialog(tk.Toplevel):
         ttk.Button(add_frame, text="Add", command=self._add_device).grid(row=0, column=6, padx=(8, 0))
 
         # Bottom buttons
-        btn_frame = ttk.Frame(self)
+        btn_frame = ttk.Frame(root)
         btn_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
 
         ttk.Button(btn_frame, text="Remove Selected", command=self._remove_device).pack(side=tk.LEFT)
         ttk.Button(btn_frame, text="Start", command=self._start).pack(side=tk.RIGHT)
 
         self.id_entry.focus_set()
-        self.bind("<Return>", lambda e: self._add_device())
+        root.bind("<Return>", lambda e: self._add_device())
 
     def _add_device(self):
         device_id = self.id_entry.get().strip()
@@ -213,13 +211,13 @@ class AddDeviceDialog(tk.Toplevel):
         baud_str = self.baud_entry.get().strip()
 
         if not device_id or not port:
-            messagebox.showwarning("Missing info", "ID and Port are required.", parent=self)
+            messagebox.showwarning("Missing info", "ID and Port are required.")
             return
 
         try:
             baud = int(baud_str)
         except ValueError:
-            messagebox.showwarning("Invalid baud", "Baud rate must be a number.", parent=self)
+            messagebox.showwarning("Invalid baud", "Baud rate must be a number.")
             return
 
         self.devices.append((device_id, port, baud))
@@ -240,10 +238,10 @@ class AddDeviceDialog(tk.Toplevel):
 
     def _start(self):
         if not self.devices:
-            messagebox.showwarning("No devices", "Add at least one device.", parent=self)
+            messagebox.showwarning("No devices", "Add at least one device.")
             return
         self.result = self.devices
-        self.destroy()
+        self.root.quit()
 
 
 class App:
@@ -303,11 +301,10 @@ def main():
     if len(sys.argv) > 1:
         devices = parse_cli_devices(sys.argv[1:])
     else:
-        # Show config dialog
+        # Show config dialog as the main window
         root = tk.Tk()
-        root.withdraw()
         dialog = AddDeviceDialog(root)
-        root.wait_window(dialog)
+        root.mainloop()
         devices = dialog.result
         root.destroy()
 
