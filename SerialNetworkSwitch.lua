@@ -54,24 +54,35 @@ end
 local COM_PORTS = { 3, 5, 7, 9 } -- example: the "game side" of each pair
 -- -----------------------------------------------------------------
 
-local ports = {}
-for i = 1, PORT_COUNT do
-	local serial = getCompList("Serial", i - 1, i - 1)[1]
-	serial.Port = COM_PORTS[i]
-	serial.ReceiveMode = SerialReceiveMode.Lines
+-- Port state must also persist across ticks so ledTimer countdowns work.
+if not ports then
+	ports = {}
+	for i = 1, PORT_COUNT do
+		local serialMod = getCompList("Serial", i - 1, i - 1)[1]
+		serialMod.Port = COM_PORTS[i]
+		serialMod.ReceiveMode = SerialReceiveMode.Lines
 
-	ports[i] = {
-		serial = serial,
-		led = getCompList("Led", i - 1, i - 1)[1],
-		ledTimer = 0,
-	}
+		ports[i] = {
+			serial = serialMod,
+			led = getCompList("Led", i - 1, i - 1)[1],
+			ledTimer = 0,
+		}
+	end
 end
 
 -- MAC/id learning table: device id string -> port index
-local addrTable = {}
+-- These must persist across ticks. In Retro Gadgets the top-level
+-- script body re-runs every frame, so plain `local x = {}` would
+-- reset each tick. We guard with an `if not` check so they're only
+-- initialized once.
+if not addrTable then
+	addrTable = {}
+end
 
 -- Rolling log of recent switching decisions, newest first
-local logLines = {}
+if not logLines then
+	logLines = {}
+end
 local MAX_LOG_LINES = 20
 
 local function pushLog(line)
