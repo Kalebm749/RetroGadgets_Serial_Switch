@@ -1,7 +1,8 @@
 """
 device_sim_gui.py — GUI multi-device simulator for the Retro Gadgets serial switch.
 
-Opens a single window with one tab per simulated device. Each tab has:
+Shows all devices simultaneously in a square grid layout. Each cell has:
+  - A header with device ID, port, and connection status
   - A scrolling terminal output area (shows sent/received messages)
   - An input field at the bottom (type "DEST message" and hit Enter to send)
 
@@ -25,6 +26,7 @@ import sys
 import threading
 import time
 import random
+import math
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
@@ -39,7 +41,6 @@ HEARTBEAT_INTERVAL = 2.0  # seconds between HELLO messages
 # REALISTIC TRAFFIC PATTERNS
 # ============================================================
 
-# Simulated traffic types with realistic payloads
 TRAFFIC_PATTERNS = {
     "http_request": [
         "GET /index.html HTTP/1.1",
@@ -121,25 +122,17 @@ TRAFFIC_PATTERNS = {
     ],
 }
 
-# Traffic scenarios: weighted sequences of what a "conversation" looks like
 TRAFFIC_SCENARIOS = [
-    # Web browsing: DNS -> HTTP request -> HTTP response
     {"weight": 30, "sequence": ["dns_query", "dns_response", "http_request", "http_response"]},
-    # Ping exchange
     {"weight": 15, "sequence": ["ping", "ping", "ping"]},
-    # File transfer
     {"weight": 10, "sequence": ["file_transfer"]},
-    # Chat messages
     {"weight": 20, "sequence": ["chat", "chat"]},
-    # Database queries
     {"weight": 15, "sequence": ["database", "database"]},
-    # Monitoring
     {"weight": 10, "sequence": ["monitoring", "monitoring"]},
 ]
 
 
 def pick_scenario():
-    """Pick a random traffic scenario based on weights."""
     total = sum(s["weight"] for s in TRAFFIC_SCENARIOS)
     r = random.randint(1, total)
     cumulative = 0
@@ -151,18 +144,17 @@ def pick_scenario():
 
 
 def pick_message(pattern_type: str) -> str:
-    """Pick a random message from a traffic pattern."""
     return random.choice(TRAFFIC_PATTERNS[pattern_type])
 
 
 # ============================================================
-# DEVICE TAB
+# DEVICE PANEL (one cell in the grid)
 # ============================================================
 
-class DeviceTab:
-    """One simulated device — owns a serial connection and a GUI tab."""
+class DevicePanel:
+    """One simulated device — owns a serial connection and a grid cell."""
 
-    def __init__(self, notebook: ttk.Notebook, device_id: str, port: str, baud: int):
+    def __init__(self, parent_frame: ttk.Frame, device_id: str, port: str, baud: int):
         self.device_id = device_id
         self.port = port
         self.baud = baud
@@ -170,14 +162,26 @@ class DeviceTab:
         self.running = False
 
         # --- GUI setup ---
-        self.frame = ttk.Frame(notebook)
-        notebook.add(self.frame, text=f" {device_id} ({port}) ")
+        # Outer frame with border
+        self.frame = ttk.LabelFrame(parent_frame, text=f" {device_id} — {port} ", padding=3)
+
+        # Status indicator
+        self.header_frame = ttk.Frame(self.frame)
+        self.header_frame.pack(fill=tk.X)
+
+        self.status_dot = tk.Label(self.header_frame, text="●", fg="gray",
+                                    font=("Segoe UI", 10))
+        self.status_dot.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.status_label = ttk.Label(self.header_frame, text="Disconnected",
+                                       font=("Segoe UI", 8))
+        self.status_label.pack(side=tk.LEFT)
 
         # Terminal output
         self.output = tk.Text(self.frame, wrap=tk.WORD, state=tk.DISABLED,
-                              bg="#1e1e1e", fg="#00ff88", font=("Consolas", 10),
-                              insertbackground="white")
-        self.output.pack(fill=tk.BOTH, expand=True, padx=4, pady=(4, 0))
+                              bg="#1e1e1e", fg="#00ff88", font=("Consolas", 9),
+                              insertbackground="white", height=10)
+        self.output.pack(fill=tk.BOTH, expand=True, pady=(3, 0))
 
         # Tags for different message types
         self.output.tag_configure("sent", foreground="#88ccff")
@@ -193,17 +197,23 @@ class DeviceTab:
 
         # Input area
         input_frame = ttk.Frame(self.frame)
-        input_frame.pack(fill=tk.X, padx=4, pady=4)
+        input_frame.pack(fill=tk.X, pady=(3, 0))
 
-        self.prompt_label = ttk.Label(input_frame, text=f"{device_id}>", font=("Consolas", 10))
+        self.prompt_label = ttk.Label(input_frame, text=f"{device_id}>",
+                                       font=("Consolas", 9))
         self.prompt_label.pack(side=tk.LEFT)
 
-        self.input_entry = ttk.Entry(input_frame, font=("Consolas", 10))
-        self.input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
+        self.input_entry = ttk.Entry(input_frame, font=("Consolas", 9))
+        self.input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 3))
         self.input_entry.bind("<Return>", self._on_send)
 
-        self.send_btn = ttk.Button(input_frame, text="Send", command=self._on_send)
+        self.send_btn = ttk.Button(input_frame, text="Send", command=self._on_send,
+                                    width=5)
         self.send_btn.pack(side=tk.RIGHT)
+
+    def grid(self, row: int, col: int):
+        """Place this panel in the parent grid."""
+        self.frame.grid(row=row, column=col, padx=3, pady=3, sticky="nsew")
 
     def log(self, text: str, tag: str = ""):
         """Append a line to the terminal output (thread-safe via after())."""
@@ -220,46 +230,50 @@ class DeviceTab:
 
         self.output.after(0, _append)
 
+    def _update_status(self, text: str, color: str):
+        """Update the status indicator (thread-safe)."""
+        def _set():
+            self.status_dot.config(fg=color)
+            self.status_label.config(text=text)
+        self.status_dot.after(0, _set)
+
     def connect(self):
         """Open the serial port and start the reader + heartbeat threads."""
         try:
             self.ser = serial.Serial(self.port, self.baud, timeout=1)
             self.running = True
-            self.log(f"Connected to {self.port} @ {self.baud} baud", "system")
-            self.log("Format: DEST message  (use ALL to broadcast)", "system")
-            self.log("", "system")
+            self._update_status("Connected", "#00cc00")
+            self.log(f"Connected to {self.port} @ {self.baud}", "system")
 
-            # Start reader thread
             reader = threading.Thread(target=self._reader_loop, daemon=True)
             reader.start()
 
-            # Start heartbeat thread
             heartbeat = threading.Thread(target=self._heartbeat_loop, daemon=True)
             heartbeat.start()
 
             return True
         except serial.SerialException as e:
-            self.log(f"FAILED to open {self.port}: {e}", "error")
+            self._update_status("Failed", "#ff0000")
+            self.log(f"FAILED: {e}", "error")
             return False
 
     def _heartbeat_loop(self):
-        """Background thread: sends HELLO:<id> periodically."""
         while self.running:
             try:
-                hello = f"HELLO:{self.device_id}\n"
-                self.ser.write(hello.encode("utf-8"))
+                self.ser.write(f"HELLO:{self.device_id}\n".encode("utf-8"))
             except serial.SerialException:
+                self._update_status("Lost", "#ff0000")
                 self.log("[heartbeat: connection lost]", "error")
                 self.running = False
                 return
             time.sleep(HEARTBEAT_INTERVAL)
 
     def _reader_loop(self):
-        """Background thread: reads lines from the serial port and handles protocol."""
         while self.running:
             try:
                 raw = self.ser.readline()
             except serial.SerialException:
+                self._update_status("Lost", "#ff0000")
                 self.log("[connection lost]", "error")
                 self.running = False
                 return
@@ -269,37 +283,32 @@ class DeviceTab:
             if not text:
                 continue
 
-            # Handle ARP:WHO-HAS:<id> — auto-reply if it's asking for us
+            # ARP:WHO-HAS:<id>
             if text.startswith("ARP:WHO-HAS:"):
                 target = text[len("ARP:WHO-HAS:"):].strip()
                 self.log(f"<< ARP WHO-HAS {target}", "arp")
                 if target == self.device_id:
-                    reply = f"ARP:IS-AT:{self.device_id}\n"
                     try:
-                        self.ser.write(reply.encode("utf-8"))
-                        self.log(f">> ARP IS-AT {self.device_id} (that's me!)", "arp")
+                        self.ser.write(f"ARP:IS-AT:{self.device_id}\n".encode("utf-8"))
+                        self.log(f">> ARP IS-AT (me!)", "arp")
                     except serial.SerialException:
                         self.log("[ARP reply failed]", "error")
-                else:
-                    self.log(f"   (not me, ignoring)", "arp")
                 continue
 
-            # Handle DATA:<src>:<dst>:<msg> — display the message
+            # DATA:<src>:<dst>:<msg>
             if text.startswith("DATA:"):
-                payload = text[5:]  # strip "DATA:" prefix
-                parts = payload.split(":", 2)
+                parts = text[5:].split(":", 2)
                 if len(parts) == 3:
                     src, dst, msg = parts
                     self.log(f"<< [{src}] {msg}")
                 else:
-                    self.log(f"<< (malformed) {text}", "error")
+                    self.log(f"<< (bad) {text}", "error")
                 continue
 
-            # Legacy format or unknown — just display
             self.log(f"<< {text}")
 
     def send_data(self, dst: str, msg: str, tag: str = "sent"):
-        """Send a DATA frame (used by both manual input and auto-test)."""
+        """Send a DATA frame."""
         if not self.ser or not self.running:
             return False
         frame = f"DATA:{self.device_id}:{dst}:{msg}\n"
@@ -312,7 +321,6 @@ class DeviceTab:
             return False
 
     def _on_send(self, event=None):
-        """Handle Enter key or Send button."""
         raw = self.input_entry.get().strip()
         self.input_entry.delete(0, tk.END)
 
@@ -331,7 +339,6 @@ class DeviceTab:
         self.send_data(dst, msg)
 
     def disconnect(self):
-        """Clean up the serial port."""
         self.running = False
         if self.ser:
             try:
@@ -347,15 +354,14 @@ class DeviceTab:
 class AutoTestEngine:
     """Generates realistic random traffic across all connected devices."""
 
-    def __init__(self, tabs: list):
-        self.tabs = tabs
+    def __init__(self, panels: list):
+        self.panels = panels
         self.running = False
         self._thread = None
-        self.rate = 2.0  # messages per second (across all devices)
-        self.burst_chance = 0.15  # chance of a burst (multiple rapid messages)
+        self.rate = 2.0
+        self.burst_chance = 0.15
 
     def start(self, rate: float = 2.0):
-        """Start generating traffic."""
         if self.running:
             return
         self.rate = rate
@@ -364,33 +370,24 @@ class AutoTestEngine:
         self._thread.start()
 
     def stop(self):
-        """Stop generating traffic."""
         self.running = False
 
-    def _get_alive_tabs(self):
-        """Get list of tabs that are connected and running."""
-        return [t for t in self.tabs if t.running and t.ser]
+    def _get_alive(self):
+        return [p for p in self.panels if p.running and p.ser]
 
     def _run(self):
-        """Main auto-test loop."""
         while self.running:
-            alive = self._get_alive_tabs()
+            alive = self._get_alive()
             if len(alive) < 2:
                 time.sleep(0.5)
                 continue
 
-            # Pick a scenario
             scenario = pick_scenario()
-
-            # Pick sender and receiver for this scenario
             sender = random.choice(alive)
-            others = [t for t in alive if t is not sender]
+            others = [p for p in alive if p is not sender]
             receiver = random.choice(others)
-
-            # Decide if this is a broadcast (10% chance)
             is_broadcast = random.random() < 0.10
 
-            # Execute the scenario sequence
             for pattern_type in scenario["sequence"]:
                 if not self.running:
                     break
@@ -399,30 +396,26 @@ class AutoTestEngine:
                 dst = "ALL" if is_broadcast else receiver.device_id
                 sender.send_data(dst, msg, "autotest")
 
-                # Small delay between messages in a sequence (simulates RTT)
-                delay = random.uniform(0.1, 0.4)
-                time.sleep(delay)
+                time.sleep(random.uniform(0.1, 0.4))
 
-                # For request-response patterns, swap sender/receiver
                 if "response" in pattern_type or "REPLY" in pattern_type:
                     sender, receiver = receiver, sender
                     if receiver not in alive:
-                        receiver = random.choice([t for t in alive if t is not sender])
+                        receiver = random.choice([p for p in alive if p is not sender])
 
-            # Check for burst mode
+            # Burst mode
             if random.random() < self.burst_chance:
                 burst_count = random.randint(3, 8)
                 for _ in range(burst_count):
                     if not self.running:
                         break
-                    burst_sender = random.choice(alive)
-                    burst_others = [t for t in alive if t is not burst_sender]
-                    burst_receiver = random.choice(burst_others)
-                    burst_msg = pick_message(random.choice(list(TRAFFIC_PATTERNS.keys())))
-                    burst_sender.send_data(burst_receiver.device_id, burst_msg, "autotest")
+                    bs = random.choice(alive)
+                    bo = [p for p in alive if p is not bs]
+                    br = random.choice(bo)
+                    bm = pick_message(random.choice(list(TRAFFIC_PATTERNS.keys())))
+                    bs.send_data(br.device_id, bm, "autotest")
                     time.sleep(random.uniform(0.05, 0.15))
 
-            # Wait based on configured rate
             base_delay = 1.0 / self.rate
             jitter = random.uniform(-base_delay * 0.3, base_delay * 0.3)
             time.sleep(max(0.1, base_delay + jitter))
@@ -434,15 +427,14 @@ class AutoTestEngine:
 
 class App:
     """
-    Single-window application. Uses ONE Tk root for the entire lifetime.
-    Starts with a config view, then swaps to the tabbed device view.
+    Single-window application with a square grid of device panels.
     """
 
     def __init__(self, devices: list = None):
         self.root = tk.Tk()
         self.root.title("Retro Gadgets — Serial Switch Device Simulator")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.tabs: list[DeviceTab] = []
+        self.panels: list[DevicePanel] = []
         self.devices = devices
         self.auto_test: AutoTestEngine = None
 
@@ -452,7 +444,6 @@ class App:
             self._build_config_view()
 
     def _build_config_view(self):
-        """Build the device configuration UI inside the root window."""
         self.root.geometry("420x350")
         self.root.resizable(False, False)
 
@@ -461,18 +452,15 @@ class App:
 
         self._config_devices = []
 
-        # Instructions
         ttk.Label(self.config_frame, text="Add simulated devices (one per switch port):",
                   font=("Segoe UI", 10)).pack(pady=(10, 5))
 
-        # Device list
         list_frame = ttk.Frame(self.config_frame)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=10)
 
         self.device_listbox = tk.Listbox(list_frame, font=("Consolas", 10), height=8)
         self.device_listbox.pack(fill=tk.BOTH, expand=True)
 
-        # Add device controls
         add_frame = ttk.Frame(self.config_frame)
         add_frame.pack(fill=tk.X, padx=10, pady=5)
 
@@ -493,7 +481,6 @@ class App:
 
         ttk.Button(add_frame, text="Add", command=self._add_device).grid(row=0, column=6, padx=(8, 0))
 
-        # Bottom buttons
         btn_frame = ttk.Frame(self.config_frame)
         btn_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
 
@@ -511,7 +498,6 @@ class App:
         if not device_id or not port:
             messagebox.showwarning("Missing info", "ID and Port are required.")
             return
-
         try:
             baud = int(baud_str)
         except ValueError:
@@ -521,7 +507,6 @@ class App:
         self._config_devices.append((device_id, port, baud))
         self.device_listbox.insert(tk.END, f"{device_id}  |  {port}  |  {baud} baud")
 
-        # Auto-increment ID suggestion
         self.id_entry.delete(0, tk.END)
         self.id_entry.insert(0, f"PC{len(self._config_devices) + 1}")
         self.port_entry.delete(0, tk.END)
@@ -539,27 +524,28 @@ class App:
             messagebox.showwarning("No devices", "Add at least one device.")
             return
         self.devices = self._config_devices
-
-        # Tear down config UI and switch to device view
         self.root.unbind("<Return>")
         self.config_frame.destroy()
         self._build_device_view()
 
     def _build_device_view(self):
-        """Build the tabbed device terminal UI inside the root window."""
-        self.root.geometry("750x550")
+        """Build the grid layout with all device panels visible at once."""
+        n = len(self.devices)
+        # Calculate grid dimensions (square-ish)
+        cols = math.ceil(math.sqrt(n))
+        rows = math.ceil(n / cols)
+
+        # Size window appropriately
+        win_w = max(700, cols * 380)
+        win_h = max(500, rows * 320)
+        self.root.geometry(f"{win_w}x{win_h}")
         self.root.resizable(True, True)
-        self.root.minsize(500, 300)
+        self.root.minsize(400, 300)
 
-        # Style
-        style = ttk.Style()
-        style.configure("TNotebook.Tab", padding=[12, 4])
-
-        # Toolbar frame at top
+        # Toolbar at top
         toolbar = ttk.Frame(self.root)
         toolbar.pack(fill=tk.X, padx=4, pady=(4, 0))
 
-        # Auto-test controls
         ttk.Label(toolbar, text="Auto-Test:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(4, 8))
 
         self.autotest_btn = ttk.Button(toolbar, text="▶ Start", command=self._toggle_autotest)
@@ -573,31 +559,39 @@ class App:
         self.rate_spinbox.pack(side=tk.LEFT, padx=2)
         ttk.Label(toolbar, text="msg/s", font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(0, 8))
 
-        # Status indicator
         self.status_label = ttk.Label(toolbar, text="● Idle", foreground="gray",
                                        font=("Segoe UI", 9))
         self.status_label.pack(side=tk.RIGHT, padx=8)
 
-        # Notebook with device tabs
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        # Grid container
+        grid_frame = ttk.Frame(self.root)
+        grid_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
-        for device_id, port, baud in self.devices:
-            tab = DeviceTab(self.notebook, device_id, port, baud)
-            self.tabs.append(tab)
+        # Configure grid weights so cells resize evenly
+        for r in range(rows):
+            grid_frame.rowconfigure(r, weight=1)
+        for c in range(cols):
+            grid_frame.columnconfigure(c, weight=1)
+
+        # Create device panels in grid
+        for idx, (device_id, port, baud) in enumerate(self.devices):
+            row = idx // cols
+            col = idx % cols
+            panel = DevicePanel(grid_frame, device_id, port, baud)
+            panel.grid(row, col)
+            self.panels.append(panel)
 
         # Initialize auto-test engine
-        self.auto_test = AutoTestEngine(self.tabs)
+        self.auto_test = AutoTestEngine(self.panels)
 
-        # Connect all devices after GUI is drawn
+        # Connect all after GUI is drawn
         self.root.after(100, self._connect_all)
 
     def _connect_all(self):
-        for tab in self.tabs:
-            tab.connect()
+        for panel in self.panels:
+            panel.connect()
 
     def _toggle_autotest(self):
-        """Toggle auto-test on/off."""
         if self.auto_test and self.auto_test.running:
             self.auto_test.stop()
             self.autotest_btn.config(text="▶ Start")
@@ -618,8 +612,8 @@ class App:
     def _on_close(self):
         if self.auto_test:
             self.auto_test.stop()
-        for tab in self.tabs:
-            tab.disconnect()
+        for panel in self.panels:
+            panel.disconnect()
         self.root.destroy()
 
     def run(self):
