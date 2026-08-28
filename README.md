@@ -8,9 +8,7 @@ The switch implements real networking concepts: MAC address learning, ARP-like a
 
 ## 🎮 Steam Workshop
 
-> **[Workshop Link — Coming Soon]**
->
-> _The Retro Gadgets device will be shared on the Steam Workshop. Link will be posted here once available._
+> https://steamcommunity.com/sharedfiles/filedetails/?id=3790769850
 
 ---
 
