@@ -4,8 +4,6 @@ A simulated Layer 2 network switch built inside [Retro Gadgets](https://store.st
 
 The switch implements real networking concepts: MAC address learning, ARP-like address resolution, heartbeat-based presence detection, and direct forwarding — all visible on the in-game screen and debug console.
 
-![Steam Workshop Badge](https://img.shields.io/badge/Steam_Workshop-Coming_Soon-blue?logo=steam)
-
 ## 🎮 Steam Workshop
 
 > https://steamcommunity.com/sharedfiles/filedetails/?id=3790769850
